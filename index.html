@@ -258,7 +258,9 @@ button,input,select{font:inherit;color:inherit}
   <footer id="statusbar" class="empty"></footer>
 </div>
 <input type="file" id="in-dir" hidden webkitdirectory multiple>
-<input type="file" id="in-file" hidden accept=".obb,.zip,.unity3d,.bundle,.assets,*/*">
+<input type="file" id="in-file" hidden accept=".obb,.zip,.unity3d,.bundle,.assets,.apk,*/*">
+<input type="file" id="in-apk" hidden accept=".apk,application/vnd.android.package-archive">
+<input type="file" id="in-lib" hidden accept=".so,application/octet-stream,*/*" multiple>
 <div id="palette" class="hidden"><input type="text" placeholder="Type the name of a command to run" spellcheck="false"><div id="pal-list"></div></div>
 <div id="toast"></div>
 <script>
@@ -809,6 +811,7 @@ const S = {
   selKey: null, sel: null, undo: [], redo: [], savedIdx: 0, gid: 0, cg: null,
   log: [], problems: [], panel: 'output', collapsed: {}, busy: null, searchRes: [], searchQ: '',
   proUnlocked: false, proScanResults: [],
+  libs: [], smaliDirty: new Map(),
 };
 const UI = {};
 
@@ -878,6 +881,7 @@ async function headBytes(en, n) {
 function resetSession() {
   S.bundles.clear(); S.tabs = []; S.active = null; S.activeSF = null; S.undo = []; S.redo = []; S.savedIdx = 0;
   S.exp.clear(); S.hierExp.clear(); S.sel = null; S.selKey = null; S.searchRes = [];
+  S.libs = []; S.smaliDirty = new Map(); S.proScanResults = [];
 }
 function setSource(src) {
   resetSession(); S.src = src; S.tree = buildTree(src.entries);
@@ -914,16 +918,110 @@ async function loadSingleFile(file) {
   try {
     const head = new Uint8Array(await file.slice(0, 8).arrayBuffer());
     const isZip = head[0] === 0x50 && head[1] === 0x4b && (head[2] === 3 || head[2] === 5);
+    const isApk = /\.apk$/i.test(file.name);
     if (isZip) {
       const dir = await readZipDir(file);
       const entries = dir.filter(z => !z.name.endsWith('/')).map(z => ({ path: z.name, size: z.usize, zip: z }));
-      setSource({ kind: 'zip', name: file.name, entries, zipFile: file, outName: file.name });
+      const kind = isApk ? 'apk' : 'zip';
+      setSource({ kind, name: file.name, entries, zipFile: file, outName: file.name });
+      if (isApk) log('APK opened. You can edit data.unity3d and Load Libs (Pro). Save repacks the APK (unsigned – resign before install).', 'ok');
     } else {
       setSource({ kind: 'file', name: file.name, entries: [{ path: file.name, blob: file, size: file.size }], outName: file.name });
       const en = S.src.entries[0]; openEntry(en);
     }
   } catch (e) { log('Failed to open ' + file.name + ': ' + e.message, 'error'); toast(e.message, 'error'); }
   busy(null);
+}
+function pickApk() { const i = $('#in-apk'); i.value = ''; i.click(); }
+function pickLib() { const i = $('#in-lib'); i.value = ''; i.click(); }
+
+/** libtest.so → "test" */
+function libNameFromFile(filename) {
+  let n = base(filename).replace(/\.so$/i, '');
+  if (/^lib/i.test(n)) n = n.slice(3);
+  return n;
+}
+
+function findUnityPlayerSmaliPaths(entries) {
+  return entries.filter(e => /UnityPlayerActivity\.smali$/i.test(e.path) && /com\/unity3d\/player/i.test(e.path)).map(e => e.path);
+}
+
+function injectLoadLibrarySmali(smaliText, libName) {
+  if (smaliText.includes(`Ljava/lang/System;->loadLibrary`) && smaliText.includes(`"${libName}"`)) {
+    return { text: smaliText, changed: false, msg: 'loadLibrary already present for ' + libName };
+  }
+  const onCreateRe = /\.method\s+[^\n]*onCreate\(Landroid\/os\/Bundle;\)V[\s\S]*?\.locals\s+(\d+)/;
+  const m = onCreateRe.exec(smaliText);
+  if (!m) {
+    // fallback: first .locals in file after any onCreate-ish method
+    const m2 = /\.method[^\n]*onCreate[\s\S]*?\.locals\s+(\d+)/.exec(smaliText);
+    if (!m2) return { text: smaliText, changed: false, msg: 'Could not find onCreate/.locals in UnityPlayerActivity.smali' };
+    const locals = parseInt(m2[1], 10);
+    const need = Math.max(locals, 2);
+    let text = smaliText;
+    if (need !== locals) text = text.replace(m2[0], m2[0].replace(`.locals ${locals}`, `.locals ${need}`));
+    const insertAt = text.indexOf(m2[0]) + (need !== locals ? m2[0].replace(`.locals ${locals}`, `.locals ${need}`).length : m2[0].length);
+    const snippet = `\n\n    const-string v0, "${libName}"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n`;
+    text = text.slice(0, insertAt) + snippet + text.slice(insertAt);
+    return { text, changed: true, msg: 'Injected loadLibrary("' + libName + '")' };
+  }
+  const locals = parseInt(m[1], 10);
+  const need = Math.max(locals, 2);
+  let block = m[0];
+  if (need !== locals) block = block.replace(`.locals ${locals}`, `.locals ${need}`);
+  const snippet = `\n\n    const-string v0, "${libName}"\n    invoke-static {v0}, Ljava/lang/System;->loadLibrary(Ljava/lang/String;)V\n`;
+  // insert right after .locals line
+  const localsLine = `.locals ${need}`;
+  const li = block.lastIndexOf(localsLine);
+  const afterLocals = li + localsLine.length;
+  block = block.slice(0, afterLocals) + snippet + block.slice(afterLocals);
+  const text = smaliText.slice(0, m.index) + block + smaliText.slice(m.index + m[0].length);
+  return { text, changed: true, msg: 'Injected loadLibrary("' + libName + '") under onCreate' };
+}
+
+async function loadLibFiles(fileList) {
+  if (!ensurePro()) return;
+  const files = [...fileList];
+  if (!files.length) return;
+  if (!S.src) { toast('Open an APK or decompiled folder first'); return; }
+  for (const file of files) {
+    if (!/\.so$/i.test(file.name) && !file.name.includes('.so')) {
+      toast('Pick a .so library file (e.g. libtest.so)', 'error');
+      continue;
+    }
+    const libName = libNameFromFile(file.name);
+    const soName = /^lib/i.test(base(file.name)) ? base(file.name) : 'lib' + libName + '.so';
+    S.libs = S.libs.filter(l => l.libName !== libName);
+    S.libs.push({ fileName: soName, libName, blob: file, size: file.size });
+    log(`Queued native lib ${soName} → System.loadLibrary("${libName}")`, 'ok');
+
+    // Inject into any UnityPlayerActivity.smali present (decompiled folder or extracted)
+    const paths = findUnityPlayerSmaliPaths(S.src.entries);
+    if (!paths.length) {
+      log('No UnityPlayerActivity.smali found (raw APK has DEX only). Lib will still be packed under lib/arm64-v8a & lib/armeabi-v7a. For smali inject, open an apktool-decompiled folder.', 'warn');
+    } else {
+      for (const p of paths) {
+        try {
+          const en = S.src.entries.find(e => e.path === p);
+          let text;
+          if (S.smaliDirty.has(p)) text = S.smaliDirty.get(p);
+          else {
+            const bytes = await entryBytes(en);
+            text = TD.decode(bytes);
+          }
+          const r = injectLoadLibrarySmali(text, libName);
+          if (r.changed) {
+            S.smaliDirty.set(p, r.text);
+            log(`${p}: ${r.msg}`, 'ok');
+            toast(r.msg);
+          } else log(`${p}: ${r.msg}`);
+        } catch (e) { log('Smali inject failed: ' + e.message, 'error'); }
+      }
+    }
+  }
+  if (S.view === 'pro') renderSidebar();
+  else toast(`Loaded ${files.length} lib(s). Open Pro tab or Save to pack.`);
+  refreshChrome();
 }
 async function walkEntry(entry, prefix, out) {
   if (entry.isFile) { const f = await new Promise((res, rej) => entry.file(res, rej)); out.push({ path: prefix + entry.name, blob: f, size: f.size }); return; }
@@ -1304,8 +1402,12 @@ function buildChanges() {
 const PRO_KEY = 'Dreamy1471';
 const PRO_STORAGE = 'ube_pro_unlocked_v1';
 const ANTI_KEYWORDS = [
-  'coke cola', 'dll', 'lemon', 'antidll', 'antilemon',
-  'playfablogin', 'playfabmanager', 'questlink', 'oculuslink', 'metalink', 'entitlementcheck'
+  'coke cola', 'coke', 'cola', 'dll', 'lemon', 'antidll', 'antilemon', 'anti-dll', 'anti_dll',
+  'playfablogin', 'playfabmanager', 'playfab', 'questlink', 'oculuslink', 'metalink',
+  'entitlementcheck', 'entitlement', 'anticheat', 'anti_cheat', 'anti-cheat', 'cheatdetect',
+  'integritycheck', 'safetynet', 'playintegrity', 'appattest', 'licensecheck', 'drmcheck',
+  'il2cppdumper', 'emulatorcheck', 'rootcheck', 'rootdetect', 'magisk', 'xposed',
+  'authguard', 'sessioncheck', 'bancheck', 'hwid', 'deviceban', 'obfuscat'
 ];
 
 function loadProState() {
@@ -1481,11 +1583,43 @@ function buildPro() {
     return wrap;
   }
 
+  // Load Libs
   wrap.append(
     h('div', { class: 'msg', style: 'padding-bottom:4px' },
+      h('div', { style: 'font-weight:600;color:#e7e7e7;margin-bottom:6px' }, 'Load Libs'),
+      h('div', { style: 'color:var(--fg2);line-height:1.5' },
+        'Pick a .so (e.g. libtest.so). On save it is packed into lib/arm64-v8a and lib/armeabi-v7a. If UnityPlayerActivity.smali is present (apktool folder), injects under onCreate:',
+        h('div', { style: 'font-family:var(--mono);font-size:11px;margin-top:6px;color:var(--fg)' },
+          'const-string v0, "test"', h('br'),
+          'invoke-static {v0}, Ljava/lang/System;->loadLibrary(...)'
+        )
+      )
+    ),
+    h('div', { style: 'padding:0 14px 10px' },
+      h('button', { class: 'btn', onclick: pickLib }, 'Choose .so Library'),
+      h('button', { class: 'btn sec2', style: 'margin-top:6px', onclick: pickApk }, 'Open APK File')
+    )
+  );
+  if (S.libs.length) {
+    wrap.append(h('div', { class: 'sec-h', style: 'cursor:default' }, `Queued libs (${S.libs.length})`));
+    for (const lib of S.libs) {
+      wrap.append(h('div', { class: 'row', style: 'position:static;height:auto;padding:6px 14px' },
+        h('span', { class: 'lab' }, lib.fileName),
+        h('span', { class: 'meta' }, `loadLibrary("${lib.libName}")`),
+        h('button', { class: 'linkbtn', style: 'margin-left:8px', onclick: () => { S.libs = S.libs.filter(x => x !== lib); renderSidebar(); } }, 'Remove')
+      ));
+    }
+  }
+  if (S.smaliDirty.size) {
+    wrap.append(h('div', { class: 'msg', style: 'color:#89d185' }, `${S.smaliDirty.size} smali file(s) patched – will be written on Save`));
+  }
+
+  // Anti cheats
+  wrap.append(
+    h('div', { class: 'msg', style: 'padding-bottom:4px;border-top:1px solid var(--border);margin-top:8px' },
       h('div', { style: 'font-weight:600;color:#e7e7e7;margin-bottom:6px' }, 'Remove Anti Cheats'),
       h('div', { style: 'color:var(--fg2);line-height:1.5' },
-        'Scan For Checks – searches GameObjects and scripts inside data.unity3d / levels for names that commonly crash or block the game (anti-DLL, PlayFab login, Oculus/Meta entitlement, etc.). Matches are disabled and their payload wiped so the check is deleted from the bundle.'
+        'Scan For Checks – searches GameObjects and scripts inside data.unity3d / levels for crash / block names (anti-DLL, PlayFab, Oculus/Meta entitlement, root/emulator checks, etc.). Matches are disabled and payload wiped (deleted).'
       )
     ),
     h('div', { style: 'padding:0 14px 10px' },
@@ -1495,7 +1629,7 @@ function buildPro() {
   );
 
   if (!S.bundles.size) {
-    wrap.append(h('div', { class: 'msg' }, 'Open a folder / .obb / data.unity3d first, then run the scan.'));
+    wrap.append(h('div', { class: 'msg' }, 'Open an APK / folder / data.unity3d first, then run the scan.'));
   } else if (!S.proScanResults.length) {
     wrap.append(h('div', { class: 'msg' }, 'No results yet. Click Scan For Checks.'));
   } else {
@@ -1540,16 +1674,17 @@ function crumb(...parts) { return h('div', { class: 'crumb' }, parts.flatMap((p,
 function buildWelcome() {
   const link = (txt, fn, k) => h('div', { class: 'link', onclick: fn }, ic('openFolder'), txt, k ? h('span', { class: 'kbd' }, k) : null);
   return h('div', { class: 'pane' }, h('div', { class: 'welcome' },
-    h('h1', {}, 'Unity Bundle Editor'), h('h2', {}, 'Edit data.unity3d in the browser - hierarchy, SetActive, components, raw bytes'),
+    h('h1', {}, 'Unity Bundle Editor'), h('h2', {}, 'Edit data.unity3d in the browser - hierarchy, SetActive, components, raw bytes, APK libs'),
     h('div', { class: 'cols' },
-      h('div', {}, h('h3', {}, 'Start'), link('Open Folder...', pickFolder, 'Ctrl+O'), link('Open File (.obb / .unity3d)...', pickFile), link('Show All Commands', openPalette, 'Ctrl+Shift+P'),
-        h('div', { class: 'drop' }, 'Drop the folder that contains assets/bin/Data/data.unity3d, an .obb, or a bare data.unity3d anywhere on this window. Saving downloads ', h('b', {}, S.src ? S.src.outName : '<folder name>.obb'), ' with the edited bundle repacked inside.')),
+      h('div', {}, h('h3', {}, 'Start'), link('Open Folder...', pickFolder, 'Ctrl+O'), link('Open File (.obb / .unity3d)...', pickFile), link('Open APK File (Load Libs)...', pickApk), link('Show All Commands', openPalette, 'Ctrl+Shift+P'),
+        h('div', { class: 'drop' }, 'Drop a folder (assets/bin/Data), .obb, data.unity3d, or .apk. Pro: Load Libs injects System.loadLibrary into UnityPlayerActivity.smali and packs .so into the APK. Saving downloads the repacked archive.')),
       h('div', {}, h('h3', {}, 'How it works'), h('table', {},
         h('tr', {}, h('td', {}, 'Hierarchy'), h('td', {}, 'Click the eye to toggle m_IsActive')),
         h('tr', {}, h('td', {}, 'Inspector'), h('td', {}, 'Layer, tag, transform, component enabled')),
         h('tr', {}, h('td', {}, 'Hex editor'), h('td', {}, 'Type hex digits to patch any asset')),
+        h('tr', {}, h('td', {}, 'Pro / Libs'), h('td', {}, 'Open APK, pick .so, inject loadLibrary, remove anti-cheats')),
         h('tr', {}, h('td', {}, 'Undo / Redo'), h('td', {}, 'Ctrl+Z / Ctrl+Y')),
-        h('tr', {}, h('td', {}, 'Save'), h('td', {}, 'Ctrl+S - downloads the .obb'))))))
+        h('tr', {}, h('td', {}, 'Save'), h('td', {}, 'Ctrl+S – downloads .obb / .apk (APK is unsigned)'))))))
   );
 }
 function buildBInfo(t) {
@@ -1741,7 +1876,8 @@ function renderStatus() {
     sf ? item('', `${sf.name}`) : null, sf ? item('', `Unity ${sf.unityVersion}`) : null, sf ? item('', `${fmt(sf.objects.length)} objects`) : null,
     S.busy ? item('', h('span', { class: 'spin' }), S.busy) : null, item('sp'));
   const ch = changeGroups().length && dirtyBundles().length ? changeGroups().length : 0;
-  sb.append(item('click', ch ? `${ch} change${ch > 1 ? 's' : ''} unsaved` : 'No changes'), sf ? item('', sf.le ? 'Little Endian' : 'Big Endian') : null,
+  const extra = (S.libs.length || S.smaliDirty.size) ? (ch ? ` + ${S.libs.length} lib(s)` : `${S.libs.length} lib(s)/smali pending`) : '';
+  sb.append(item('click', ch || extra ? (ch ? `${ch} change${ch > 1 ? 's' : ''} unsaved` : '') + extra : 'No changes'), sf ? item('', sf.le ? 'Little Endian' : 'Big Endian') : null,
     sf && sf.bundle.kind !== 'raw' ? item('', `UnityFS ${sf.bundle.version}`) : null, item('click', ic('check'), 'Save'));
   sb.lastChild.onclick = save; sb.children[sb.children.length - 3].onclick = () => setView('changes');
   sb.children[1].onclick = () => { S.panel = 'problems'; $('#panel').classList.remove('hidden'); renderPanel(); };
@@ -1764,10 +1900,14 @@ function download(blob, name) {
   const a = h('a', { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 600000);
 }
+function hasPendingOutputChanges() {
+  return dirtyBundles().length > 0 || S.libs.length > 0 || S.smaliDirty.size > 0;
+}
+
 async function save() {
   const mods = dirtyBundles();
   if (!S.src) { toast('Nothing is open'); return; }
-  if (!mods.length) { toast('No changes to save'); return; }
+  if (!hasPendingOutputChanges()) { toast('No changes to save'); return; }
   try {
     const repl = new Map();
     for (const b of mods) {
@@ -1775,23 +1915,51 @@ async function save() {
       const blob = b.kind === 'raw' ? new Blob([b.data]) : await writeBundle(b, f => busy('Repacking ' + base(b.path), f));
       repl.set(b.path, blob); log(`Repacked ${b.path}: ${fmt(blob.size)} bytes`);
     }
+    // Smali text replacements
+    for (const [path, text] of S.smaliDirty) {
+      const blob = new Blob([TE.encode(text)]);
+      repl.set(path, blob);
+      log(`Patched smali ${path}`);
+    }
     let out, name;
     if (S.src.kind === 'file') { out = repl.get(S.src.entries[0].path); name = S.src.outName; }
     else {
       const entries = [], t = dosNow(); let i = 0;
+      const skipSig = S.src.kind === 'apk'; // strip old signatures so APK can be resigned
       for (const en of S.src.entries) {
         busy(`Packing ${base(en.path)}`, i++ / S.src.entries.length);
+        if (skipSig && /^META-INF\//i.test(en.path) && /\.(SF|RSA|DSA|EC)$/i.test(en.path)) continue;
+        if (skipSig && /^META-INF\/MANIFEST\.MF$/i.test(en.path)) continue;
+        // skip old copies of libs we are replacing
+        if (S.libs.some(l => en.path === `lib/arm64-v8a/${l.fileName}` || en.path === `lib/armeabi-v7a/${l.fileName}` || en.path === `lib/armeabi/${l.fileName}`)) continue;
         const r = repl.get(en.path);
         if (r) entries.push({ name: en.path, method: 0, ...t, crc: await crc32Blob(r), csize: r.size, usize: r.size, data: r });
         else if (en.zip) entries.push({ name: en.path, method: en.zip.method, time: en.zip.time, date: en.zip.date, crc: en.zip.crc, csize: en.zip.csize, usize: en.zip.usize, data: await zipRaw(S.src.zipFile, en.zip) });
         else entries.push({ name: en.path, method: 0, ...t, crc: await crc32Blob(en.blob), csize: en.blob.size, usize: en.blob.size, data: en.blob });
       }
-      out = buildZip(entries); name = S.src.outName;
+      // Add native libs into common ABIs
+      for (const lib of S.libs) {
+        for (const abi of ['arm64-v8a', 'armeabi-v7a']) {
+          const path = `lib/${abi}/${lib.fileName}`;
+          busy('Adding ' + path);
+          const data = lib.blob;
+          const size = data.size != null ? data.size : (await data.arrayBuffer()).byteLength;
+          const blob = data instanceof Blob ? data : new Blob([data]);
+          entries.push({ name: path, method: 0, ...t, crc: await crc32Blob(blob), csize: blob.size, usize: blob.size, data: blob });
+          log(`Added ${path} (${fmt(blob.size)} bytes)`);
+        }
+      }
+      out = buildZip(entries);
+      name = S.src.outName;
+      if (S.src.kind === 'apk' && !/\.apk$/i.test(name)) name += '.apk';
     }
     busy(null); download(out, name);
     for (const b of mods) b.orig.clear();
+    S.smaliDirty.clear();
     S.savedIdx = S.undo.length; refresh();
-    log(`Saved ${name} (${fmt(out.size)} bytes)`, 'ok'); toast(`Saved ${name}`);
+    log(`Saved ${name} (${fmt(out.size)} bytes)`, 'ok');
+    if (S.src.kind === 'apk') toast(`Saved ${name} (unsigned – resign with uber-apk-signer / apksigner before install)`);
+    else toast(`Saved ${name}`);
   } catch (e) { busy(null); log('Save failed: ' + e.message, 'error'); toast('Save failed: ' + e.message, 'error'); }
 }
 
@@ -1804,7 +1972,7 @@ function showCtx(x, y, items) {
   const r = el.getBoundingClientRect(); el.style.left = Math.min(x, innerWidth - r.width - 4) + 'px'; el.style.top = Math.min(y, innerHeight - r.height - 4) + 'px';
 }
 const MENUS = () => ({
-  File: [{ label: 'Open Folder...', key: 'Ctrl+O', run: pickFolder }, { label: 'Open File...', key: 'Ctrl+Shift+O', run: pickFile }, '-', { label: 'Save (download)', key: 'Ctrl+S', run: save }, '-', { label: 'Close Editor', key: 'Ctrl+W', run: () => S.active && closeTab(S.active) }],
+  File: [{ label: 'Open Folder...', key: 'Ctrl+O', run: pickFolder }, { label: 'Open File...', key: 'Ctrl+Shift+O', run: pickFile }, { label: 'Open APK File (Load Libs)...', run: pickApk }, '-', { label: 'Save (download)', key: 'Ctrl+S', run: save }, '-', { label: 'Close Editor', key: 'Ctrl+W', run: () => S.active && closeTab(S.active) }],
   Edit: [{ label: 'Undo', key: 'Ctrl+Z', run: undo }, { label: 'Redo', key: 'Ctrl+Y', run: redo }, '-', { label: 'Discard All Changes', run: discardAll }, '-', { label: 'Find in Assets', key: 'Ctrl+F', run: focusFilter }],
   Selection: [{ label: 'Enable All GameObjects in File', run: () => S.activeSF && setAllActive(S.activeSF, true) }, { label: 'Disable All GameObjects in File', run: () => S.activeSF && setAllActive(S.activeSF, false) }, '-',
     { label: 'Enable All Components in File', run: () => S.activeSF && setAllEnabled(S.activeSF, true) }, { label: 'Disable All Components in File', run: () => S.activeSF && setAllEnabled(S.activeSF, false) }],
@@ -1826,7 +1994,7 @@ function showKeys() {
 }
 function focusFilter() { const f = $('#tbl-filter') || UI.hierFilter; if (f) { f.focus(); f.select(); } }
 const COMMANDS = () => [
-  { label: 'File: Open Folder...', key: 'Ctrl+O', run: pickFolder }, { label: 'File: Open File...', run: pickFile }, { label: 'File: Save and Download', key: 'Ctrl+S', run: save },
+  { label: 'File: Open Folder...', key: 'Ctrl+O', run: pickFolder }, { label: 'File: Open File...', run: pickFile }, { label: 'File: Open APK File (Load Libs)...', run: pickApk }, { label: 'Pro: Choose .so Library', run: pickLib }, { label: 'File: Save and Download', key: 'Ctrl+S', run: save },
   { label: 'Edit: Undo', key: 'Ctrl+Z', run: undo }, { label: 'Edit: Redo', key: 'Ctrl+Y', run: redo }, { label: 'Edit: Discard All Changes', run: discardAll },
   { label: 'Unity: Enable All GameObjects in Active File', run: () => S.activeSF && setAllActive(S.activeSF, true) }, { label: 'Unity: Disable All GameObjects in Active File', run: () => S.activeSF && setAllActive(S.activeSF, false) },
   { label: 'Unity: Enable All Components (m_Enabled) in Active File', run: () => S.activeSF && setAllEnabled(S.activeSF, true) }, { label: 'Unity: Disable All Components (m_Enabled) in Active File', run: () => S.activeSF && setAllEnabled(S.activeSF, false) },
@@ -1861,6 +2029,8 @@ function init() {
   renderMenubar(); initSash('#sash-side', 'v'); initSash('#sash-panel', 'h');
   $('#in-dir').addEventListener('change', e => loadFolderFiles(e.target.files));
   $('#in-file').addEventListener('change', e => e.target.files[0] && loadSingleFile(e.target.files[0]));
+  $('#in-apk').addEventListener('change', e => e.target.files[0] && loadSingleFile(e.target.files[0]));
+  $('#in-lib').addEventListener('change', e => e.target.files.length && loadLibFiles(e.target.files));
   document.addEventListener('click', e => { if (!e.target.closest('#ctx') && !e.target.closest('.menu-item')) hideCtx(); });
   document.addEventListener('contextmenu', e => { if (!e.target.closest('.row, .tab, .menu-item, input')) { /* keep default off for app surface */ } });
   document.addEventListener('keydown', e => {
