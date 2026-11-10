@@ -775,6 +775,7 @@ const ICONS = {
   a_search: sv('<circle cx="14" cy="10" r="6"/><path d="M9.7 14.3L3.5 20.5"/>', '0 0 24 24', 1.5),
   a_changes: sv('<circle cx="6" cy="5" r="2.5"/><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="8.5" r="2.5"/><path d="M6 7.5v9M18 11c0 4.5-12 2.5-12 5.5"/>', '0 0 24 24', 1.4),
   a_gear: sv('<circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M18.7 5.3l-2.1 2.1M7.4 16.6l-2.1 2.1"/>', '0 0 24 24', 1.4),
+  a_pro: sv('<path d="M12 2.5l2.2 4.5 5 .7-3.6 3.5.9 5.1L12 14.2 7.5 16.3l.9-5.1L4.8 7.7l5-.7z"/>', '0 0 24 24', 1.4),
 };
 function ic(name, cls = '') { return h('span', { class: 'ic ' + cls, html: ICONS[name] || '' }); }
 function ibtn(name, title, fn) { return h('span', { class: 'icon-btn', title, onclick: e => { e.stopPropagation(); fn(e); } }, ic(name)); }
@@ -807,6 +808,7 @@ const S = {
   view: 'explorer', exp: new Set(), hierExp: new Set(), hierFilter: '', hierInactive: false,
   selKey: null, sel: null, undo: [], redo: [], savedIdx: 0, gid: 0, cg: null,
   log: [], problems: [], panel: 'output', collapsed: {}, busy: null, searchRes: [], searchQ: '',
+  proUnlocked: false, proScanResults: [],
 };
 const UI = {};
 
@@ -1114,6 +1116,7 @@ function renderSidebar() {
   const sb = $('#sidebar'); sb.replaceChildren(); UI.files = UI.hier = UI.search = UI.changes = null;
   if (S.view === 'explorer') sb.append(buildExplorer());
   else if (S.view === 'search') sb.append(buildSearch());
+  else if (S.view === 'pro') sb.append(buildPro());
   else sb.append(buildChanges());
 }
 function buildExplorer() {
@@ -1294,6 +1297,230 @@ function buildChanges() {
   wrap.append(h('div', { class: 'sec-h', style: 'cursor:default;margin-top:10px' }, 'History (' + groups.length + ')'));
   groups.slice().reverse().forEach(g => wrap.append(h('div', { class: 'row', style: 'position:static;height:22px;padding-left:14px', title: g.label }, h('span', { class: 'lab' }, g.label), g.n > 1 ? h('span', { class: 'meta' }, g.n + ' edits') : null)));
   wrap.append(h('div', { style: 'padding:14px 14px' }, h('button', { class: 'btn', onclick: save }, 'Save and Download ' + (S.src ? S.src.outName : ''))));
+  return wrap;
+}
+
+/* ---------------------------------------------------------- pro / anti-cheat scan + remove */
+const PRO_KEY = 'Dreamy1471';
+const PRO_STORAGE = 'ube_pro_unlocked_v1';
+const ANTI_KEYWORDS = [
+  'coke cola', 'dll', 'lemon', 'antidll', 'antilemon',
+  'playfablogin', 'playfabmanager', 'questlink', 'oculuslink', 'metalink', 'entitlementcheck'
+];
+
+function loadProState() {
+  try { S.proUnlocked = localStorage.getItem(PRO_STORAGE) === '1'; } catch (e) { S.proUnlocked = false; }
+}
+function saveProState() {
+  try { localStorage.setItem(PRO_STORAGE, S.proUnlocked ? '1' : '0'); } catch (e) { /* ignore */ }
+}
+function promptProKey() {
+  const k = window.prompt('Enter Pro key to unlock Remove Anti Cheats:');
+  if (k === null) return false;
+  if (k.trim() === PRO_KEY) {
+    S.proUnlocked = true;
+    saveProState();
+    toast('Pro unlocked. Key saved on this device.');
+    log('Pro unlocked', 'ok');
+    return true;
+  }
+  toast('Invalid key', 'error');
+  return false;
+}
+function ensurePro() {
+  if (S.proUnlocked) return true;
+  return promptProKey();
+}
+
+function matchesAnti(name) {
+  if (!name) return null;
+  const low = name.toLowerCase().replace(/\s+/g, ' ');
+  for (const kw of ANTI_KEYWORDS) {
+    if (low.includes(kw)) return kw;
+  }
+  return null;
+}
+
+async function runAntiScan() {
+  if (!ensurePro()) return;
+  if (!S.bundles.size) {
+    toast('Open a bundle (e.g. data.unity3d) first');
+    return;
+  }
+  busy('Scanning for checks...');
+  const results = [];
+  const seen = new Set();
+  for (const b of S.bundles.values()) {
+    for (let i = 0; i < b.nodes.length; i++) {
+      const n = b.nodes[i];
+      if (!(n.flags & 4) && /\.(resS|resource|ress)$/i.test(n.path)) continue;
+      const sf = getSF(b, i);
+      if (!sf) continue;
+      for (const o of sf.objects) {
+        let hitName = '', hitKw = null, kind = '';
+        if (o.classID === 1) {
+          const nm = objName(sf, o);
+          hitKw = matchesAnti(nm);
+          if (hitKw) { hitName = nm; kind = 'GameObject'; }
+        } else if (o.classID === 114) {
+          const own = monoOwnName(sf, o) || '';
+          const scr = monoScriptName(sf, o) || '';
+          hitKw = matchesAnti(own) || matchesAnti(scr);
+          if (hitKw) { hitName = own || scr || className(o.classID); kind = 'MonoBehaviour / Script'; }
+        } else {
+          const nm = objName(sf, o);
+          hitKw = matchesAnti(nm);
+          if (hitKw) { hitName = nm; kind = className(o.classID); }
+        }
+        if (hitKw) {
+          const key = sf.key + '|' + o.id;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push({ sf, o, name: hitName, kind, kw: hitKw, path: sf.name });
+        }
+      }
+      await tick();
+    }
+  }
+  busy(null);
+  S.proScanResults = results;
+  log(`Anti-cheat scan: ${results.length} match(es)`, results.length ? 'warn' : 'ok');
+  toast(results.length ? `Found ${results.length} potential check(s)` : 'No matching checks found');
+  renderSidebar();
+}
+
+/** Fully neutralize a hit: disable GO (and its enabled components) or disable component; then wipe object payload so the check is deleted in practice. */
+function removeAntiHit(hit) {
+  if (!ensurePro()) return;
+  const { sf, o } = hit;
+  const b = sf.bundle;
+  withGroup(`Remove anti-check "${hit.name || o.id}"`, () => {
+    if (o.classID === 1) {
+      const sc = sceneOf(sf);
+      const n = sc.goNodes.get(o.id);
+      if (n && n.go) {
+        setActive(sf, n, false);
+        for (const c of n.go.comps) {
+          if (c.file !== 0) continue;
+          const co = sf.objMap.get(c.id);
+          if (co) {
+            const e = readEnabled(sf, co);
+            if (e && e.value) setCompEnabled(sf, co, false);
+          }
+        }
+      }
+    } else {
+      const e = readEnabled(sf, o);
+      if (e) setCompEnabled(sf, o, false);
+    }
+    // Wipe object bytes (same size) so the check data is deleted from the bundle
+    if (o.byteSize > 0) {
+      const zeros = new Uint8Array(o.byteSize);
+      patch(b, sf.base + o.byteStart, zeros, `Delete payload of ${hit.name || o.id}`);
+      invalidate(b);
+    }
+  });
+  toast(`Removed "${hit.name || o.id}"`);
+  S.proScanResults = S.proScanResults.filter(x => !(x.sf === sf && x.o.id === o.id));
+  refresh();
+}
+
+function removeAllAntiHits() {
+  if (!ensurePro()) return;
+  if (!S.proScanResults.length) { toast('Run scan first'); return; }
+  const list = S.proScanResults.slice();
+  withGroup('Remove all scanned anti-cheat checks', () => {
+    let c = 0;
+    for (const hit of list) {
+      const { sf, o } = hit;
+      const b = sf.bundle;
+      if (o.classID === 1) {
+        const sc = sceneOf(sf);
+        const n = sc.goNodes.get(o.id);
+        if (n && n.go) {
+          setActive(sf, n, false);
+          for (const comp of n.go.comps) {
+            if (comp.file !== 0) continue;
+            const co = sf.objMap.get(comp.id);
+            if (co) {
+              const e = readEnabled(sf, co);
+              if (e && e.value) setCompEnabled(sf, co, false);
+            }
+          }
+        }
+      } else {
+        const e = readEnabled(sf, o);
+        if (e) setCompEnabled(sf, o, false);
+      }
+      if (o.byteSize > 0) {
+        const zeros = new Uint8Array(o.byteSize);
+        patch(b, sf.base + o.byteStart, zeros, `Delete payload of ${hit.name || o.id}`);
+        invalidate(b);
+      }
+      c++;
+    }
+    log(`Removed ${c} anti-cheat object(s)`);
+    toast(`Removed ${c} object(s)`);
+  });
+  S.proScanResults = [];
+  refresh();
+}
+
+function buildPro() {
+  const wrap = h('div', { style: 'display:flex;flex-direction:column;flex:1;min-height:0;overflow:auto' });
+  wrap.append(h('div', { class: 'sb-title' }, 'Pro'));
+
+  if (!S.proUnlocked) {
+    wrap.append(
+      h('div', { class: 'msg' },
+        'Pro features are locked.',
+        h('button', { class: 'btn', onclick: () => { if (promptProKey()) renderSidebar(); } }, 'Enter Pro Key'),
+        h('div', { style: 'margin-top:12px;color:var(--fg3);font-size:12px' }, 'Key is stored only on this device (localStorage).')
+      )
+    );
+    return wrap;
+  }
+
+  wrap.append(
+    h('div', { class: 'msg', style: 'padding-bottom:4px' },
+      h('div', { style: 'font-weight:600;color:#e7e7e7;margin-bottom:6px' }, 'Remove Anti Cheats'),
+      h('div', { style: 'color:var(--fg2);line-height:1.5' },
+        'Scan For Checks – searches GameObjects and scripts inside data.unity3d / levels for names that commonly crash or block the game (anti-DLL, PlayFab login, Oculus/Meta entitlement, etc.). Matches are disabled and their payload wiped so the check is deleted from the bundle.'
+      )
+    ),
+    h('div', { style: 'padding:0 14px 10px' },
+      h('button', { class: 'btn', onclick: runAntiScan }, 'Scan For Checks'),
+      S.proScanResults.length ? h('button', { class: 'btn sec2', style: 'margin-top:6px', onclick: removeAllAntiHits }, 'Remove All Matches') : null
+    )
+  );
+
+  if (!S.bundles.size) {
+    wrap.append(h('div', { class: 'msg' }, 'Open a folder / .obb / data.unity3d first, then run the scan.'));
+  } else if (!S.proScanResults.length) {
+    wrap.append(h('div', { class: 'msg' }, 'No results yet. Click Scan For Checks.'));
+  } else {
+    wrap.append(h('div', { class: 'sec-h', style: 'cursor:default' }, `Matches (${S.proScanResults.length})`));
+    const list = h('div', { style: 'overflow:auto;flex:1' });
+    for (const hit of S.proScanResults) {
+      const row = h('div', {
+        class: 'row',
+        style: 'position:static;height:auto;min-height:22px;padding:6px 14px;align-items:flex-start;flex-direction:column;gap:2px',
+      },
+        h('div', { style: 'display:flex;align-items:center;gap:6px;width:100%' },
+          ic(hit.o.classID === 1 ? 'cube' : 'braces', hit.o.classID === 1 ? 'c-cube' : 'c-mono'),
+          h('span', { class: 'lab', style: 'flex:1' }, hit.name || '(unnamed)'),
+          h('span', { class: 'meta' }, hit.kw)
+        ),
+        h('div', { style: 'font-size:11px;color:var(--fg3);padding-left:22px' }, `${hit.kind} · ${hit.path} · ID ${hit.o.id}`),
+        h('div', { style: 'padding-left:22px;display:flex;gap:8px;margin-top:2px' },
+          h('button', { class: 'linkbtn', onclick: () => openObject(hit.sf, hit.o, true) }, 'Open'),
+          h('button', { class: 'linkbtn', onclick: () => removeAntiHit(hit) }, 'Remove')
+        )
+      );
+      list.append(row);
+    }
+    wrap.append(list);
+  }
   return wrap;
 }
 
@@ -1480,8 +1707,13 @@ function renderActivity() {
   const a = $('#activitybar'); a.replaceChildren();
   const mk = (v, name, title) => h('div', { class: 'act' + (S.view === v ? ' active' : ''), title, onclick: () => (S.view === v ? toggleSidebar() : setView(v)) }, ic(name),
     v === 'changes' && changeGroups().length && dirtyBundles().length ? h('span', { class: 'badge' }, changeGroups().length) : null);
-  a.append(mk('explorer', 'a_files', 'Explorer (Ctrl+Shift+E)'), mk('search', 'a_search', 'Search (Ctrl+Shift+F)'), mk('changes', 'a_changes', 'Changes (Ctrl+Shift+G)'),
-    h('div', { class: 'act grow', title: 'Manage', onclick: e => showCtx(e.clientX + 10, e.clientY - 90, [{ label: 'Command Palette...', key: 'Ctrl+Shift+P', run: openPalette }, { label: 'Toggle Panel', key: 'Ctrl+J', run: togglePanel }, { label: 'Keyboard Shortcuts', run: showKeys }]) }, ic('a_gear')));
+  a.append(
+    mk('explorer', 'a_files', 'Explorer (Ctrl+Shift+E)'),
+    mk('search', 'a_search', 'Search (Ctrl+Shift+F)'),
+    mk('changes', 'a_changes', 'Changes (Ctrl+Shift+G)'),
+    mk('pro', 'a_pro', 'Pro – Remove Anti Cheats'),
+    h('div', { class: 'act grow', title: 'Manage', onclick: e => showCtx(e.clientX + 10, e.clientY - 90, [{ label: 'Command Palette...', key: 'Ctrl+Shift+P', run: openPalette }, { label: 'Toggle Panel', key: 'Ctrl+J', run: togglePanel }, { label: 'Keyboard Shortcuts', run: showKeys }]) }, ic('a_gear'))
+  );
 }
 function toggleSidebar() { $('#sidebar').classList.toggle('hidden'); $('#sash-side').classList.toggle('hidden'); }
 function renderTabs() {
@@ -1523,7 +1755,7 @@ function renderPanel() {
   const b = p.querySelector('.pbody'); b.scrollTop = b.scrollHeight;
 }
 function togglePanel() { $('#panel').classList.toggle('hidden'); }
-function refreshChrome() { renderActivity(); renderTabs(); renderTitle(); renderStatus(); refreshFiles(); if (S.view === 'changes') renderSidebar(); }
+function refreshChrome() { renderActivity(); renderTabs(); renderTitle(); renderStatus(); refreshFiles(); if (S.view === 'changes' || S.view === 'pro') renderSidebar(); }
 function refresh() { refreshChrome(); refreshHier(); renderEditor(); }
 function renderAll() { renderActivity(); renderSidebar(); renderTabs(); renderEditor(); renderTitle(); renderStatus(); renderPanel(); }
 
@@ -1600,6 +1832,8 @@ const COMMANDS = () => [
   { label: 'Unity: Enable All Components (m_Enabled) in Active File', run: () => S.activeSF && setAllEnabled(S.activeSF, true) }, { label: 'Unity: Disable All Components (m_Enabled) in Active File', run: () => S.activeSF && setAllEnabled(S.activeSF, false) },
   { label: 'Unity: Show Only Inactive GameObjects', run: () => { S.hierInactive = !S.hierInactive; setView('explorer'); } },
   { label: 'View: Show Explorer', run: () => setView('explorer') }, { label: 'View: Show Search', run: () => setView('search') }, { label: 'View: Show Changes', run: () => setView('changes') },
+  { label: 'View: Show Pro (Remove Anti Cheats)', run: () => setView('pro') },
+  { label: 'Pro: Scan For Checks', run: runAntiScan },
   { label: 'View: Toggle Panel', key: 'Ctrl+J', run: togglePanel }, { label: 'View: Toggle Sidebar', key: 'Ctrl+B', run: toggleSidebar }, { label: 'Help: Keyboard Shortcuts', run: showKeys },
 ];
 function openPalette() {
@@ -1623,6 +1857,7 @@ function initSash(id, dir) {
   });
 }
 function init() {
+  loadProState();
   renderMenubar(); initSash('#sash-side', 'v'); initSash('#sash-panel', 'h');
   $('#in-dir').addEventListener('change', e => loadFolderFiles(e.target.files));
   $('#in-file').addEventListener('change', e => e.target.files[0] && loadSingleFile(e.target.files[0]));
